@@ -1,7 +1,6 @@
 import logging
 from aiogram import Bot, Dispatcher
 from aiogram.types import BotCommandScopeDefault, BotCommand
-from aiogram.filters import BaseFilter
 from aiogram import types
 
 from config import cfg
@@ -12,13 +11,14 @@ from handlers.nicks_handler import router as nicks_router
 from handlers.warns_handler import router as warns_router
 from db import AsyncSessionLocal
 from models import Chat, RoleAssignment
+from sqlalchemy import select
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-bot = Bot(token=cfg.BOT_TOKEN, parse_mode=cfg.PARSE_MODE)
+# NOTE: parse_mode must NOT be passed to Bot() in aiogram >=3.7.
+bot = Bot(token=cfg.BOT_TOKEN)
 dp = Dispatcher()
-
 
 # Register routers
 dp.include_router(start_router)
@@ -31,50 +31,53 @@ dp.include_router(warns_router)
 async def on_my_chat_member(update: types.ChatMemberUpdated):
     """
     Auto assign Owner role when bot is added to a chat.
+    More robust owner detection: use get_chat_administrators and pick status == 'creator'.
     """
-    # when bot becomes member or administrator in a group
-    new = update.new_chat_member
-    if new and new.status in ("member", "administrator"):
+    try:
+        # If bot was added to the chat (or promoted), try to detect and assign owner
         chat = update.chat
-        # find chat owner via get_chat_administrators and detect ChatMemberOwner
+        if chat is None:
+            return
+
+        # Ensure chat exists
+        async with AsyncSessionLocal() as session:
+            q = await session.execute(select(Chat).where(Chat.id == chat.id))
+            ch = q.scalars().first()
+            if not ch:
+                ch = Chat(id=chat.id)
+                session.add(ch)
+                await session.commit()
+
+        # Get admins and find creator
         try:
             admins = await bot.get_chat_administrators(chat.id)
-            owner = None
-            for a in admins:
-                if a.status == "creator" or a.status == "administrator" and getattr(a, "is_owner", False):
-                    # 'creator' indicates owner
-                    owner = a.user
-                    break
-                if a.status == "creator":
-                    owner = a.user
-                    break
-            if not owner:
-                # fallback: pick first with status 'creator'
-                for a in admins:
-                    if a.status == "creator":
-                        owner = a.user
-                        break
-            if owner:
-                async with AsyncSessionLocal() as session:
-                    q = await session.execute(select(Chat).where(Chat.id == chat.id))
-                    ch = q.scalars().first()
-                    if not ch:
-                        ch = Chat(id=chat.id)
-                        session.add(ch)
-                        await session.commit()
-                    # assign owner role (5)
-                    q = await session.execute(select(RoleAssignment).where(RoleAssignment.chat_id==chat.id, RoleAssignment.user_id==owner.id))
-                    existing = q.scalars().first()
-                    if existing:
-                        existing.role_id = 5
-                        session.add(existing)
-                    else:
-                        ra = RoleAssignment(chat_id=chat.id, user_id=owner.id, role_id=5, assigned_by=None)
-                        session.add(ra)
-                    await session.commit()
-                    logger.info("Assigned owner role in chat %s to user %s", chat.id, owner.id)
         except Exception as e:
-            logger.exception("Error assigning owner role: %s", e)
+            logger.exception("Could not get chat administrators for chat %s: %s", chat.id, e)
+            return
+
+        owner = None
+        for a in admins:
+            # In API 'creator' marks chat owner
+            # a.status is usually a string like 'creator' or ChatMemberStatus.CREATOR
+            if getattr(a, "status", "").lower() == "creator":
+                owner = a.user
+                break
+
+        if owner:
+            async with AsyncSessionLocal() as session:
+                # assign owner role (5)
+                q = await session.execute(select(RoleAssignment).where(RoleAssignment.chat_id == chat.id, RoleAssignment.user_id == owner.id))
+                existing = q.scalars().first()
+                if existing:
+                    existing.role_id = 5
+                    session.add(existing)
+                else:
+                    ra = RoleAssignment(chat_id=chat.id, user_id=owner.id, role_id=5, assigned_by=None)
+                    session.add(ra)
+                await session.commit()
+                logger.info("Assigned owner role in chat %s to user %s", chat.id, owner.id)
+    except Exception as e:
+        logger.exception("Error in on_my_chat_member: %s", e)
 
 
 async def main():
